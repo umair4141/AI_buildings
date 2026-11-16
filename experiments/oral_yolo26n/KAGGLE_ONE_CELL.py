@@ -5,7 +5,7 @@
 RUN = 1          # 1 = Exp-1 q-rung | 2 = Exp-2 plain gate | 0 = prepare only
 IMGSZ = 1280
 EPOCHS = 100
-BATCH = 4
+BATCH = 16
 SEED = 0
 
 KAGGLE_ROOT = "/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset"
@@ -327,9 +327,8 @@ elif RUN in (1, 2):
         workers=2,
         project=str(RUNS),
         name=run_name,
-        optimizer="AdamW",
-        lr0=0.001,
-        patience=30,
+        optimizer="auto",
+        patience=0,
         save=True,
         plots=True,
     )
