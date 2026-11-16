@@ -13,7 +13,7 @@
 RUN = 1                 # 1 = Exp-1 q-rung | 2 = Exp-2 plain gate
 IMGSZ = 1280
 EPOCHS = 100
-BATCH = 4
+BATCH = 16
 SEED = 0
 Q_INIT = 2.0            # start q (Pythagorean)
 LEARN_Q = True
