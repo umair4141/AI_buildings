@@ -1,20 +1,14 @@
 # Paste this WHOLE file into ONE Kaggle notebook cell.
 # Run one experiment at a time by changing RUN, then re-run the cell.
 #
-# RUN = 0  -> plain YOLO26n baseline (official Concat, from scratch)
-# RUN = 1  -> Exp-1 proposed: cross-stream Gaussian q-rung gated fusion (learnable q)
-# RUN = 2  -> Exp-2 control A: same gate net, plain features, matched 2*sigmoid range
+# RUN = 1  -> Exp-1 proposed: Gaussian q-rung gate (learnable q)
+# RUN = 2  -> Exp-2 control: plain feature gate (no q)
 #
-# Fixes vs previous broken cell:
-# - skip unknown COCO category_id (fixes KeyError 0)
-# - build official YOLO26n YAML with Concat, then REPLACE Concat modules (no broken parse_model hack)
-# - unequal merge channels supported (lazy init); output is cat like Concat
-# - from scratch (no yolo26n.pt load)
-# - optimizer=auto, patience=0, batch=16
-# - val/test split from official val2017
+# No Exp-0 / plain YOLO26n baseline.
+# From scratch, patience=0.
 
 # ===================== SETTINGS =====================
-RUN = 0          # 0=baseline | 1=q-rung proposed | 2=plain-gate control
+RUN = 1          # 1=q-rung proposed | 2=plain-gate control
 IMGSZ = 1280
 EPOCHS = 100
 BATCH = 16
@@ -398,21 +392,15 @@ def smoke_forward(model):
     print("smoke_forward OK")
 
 run_names = {
-    0: "exp0_yolo26n_baseline",
     1: "exp1_qrof_gate",
     2: "exp2_plain_gate",
 }
-assert RUN in run_names, "RUN must be 0, 1, or 2"
+assert RUN in run_names, "RUN must be 1 or 2"
 
-print(f"Building YOLO26n from YAML (from scratch), RUN={RUN} ({run_names[RUN]})")
+print(f"Building YOLO26n + gate (from scratch), RUN={RUN} ({run_names[RUN]})")
 model = YOLO(str(yaml_path))  # architecture only — NO pretrained load
-
-if RUN in (1, 2):
-    n_rep = replace_concats(model, RUN)
-    print(f"Replaced {n_rep} Concat modules")
-else:
-    print("Baseline: keeping official Concat")
-
+n_rep = replace_concats(model, RUN)
+print(f"Replaced {n_rep} Concat modules")
 smoke_forward(model)
 
 model.train(
@@ -440,6 +428,5 @@ if best.exists():
     m.val(data=str(data_yaml), split="test", imgsz=IMGSZ, plots=False)
 
 # One-by-one:
-# 1) RUN=0 baseline
-# 2) RUN=1 proposed q-rung
-# 3) RUN=2 plain-gate control
+# 1) RUN=1 proposed q-rung
+# 2) RUN=2 plain-gate control
