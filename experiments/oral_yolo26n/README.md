@@ -1,20 +1,14 @@
-# YOLO26n oral experiments (Exp-1 vs Exp-2 only)
+# Oral YOLO26n — Exp-1 vs Exp-2 only
 
-No Exp-0 baseline.
-
-| RUN | Name | What |
-|---|---|---|
-| **1** | `exp1_qrof_gate` | Gaussian q-rung gate (learnable \(q\)) |
-| **2** | `exp2_plain_gate` | Plain feature gate (no \(q\)) |
-
-## Kaggle one cell
-
-Paste `KAGGLE_ONE_CELL.py`, then:
+Paste `KAGGLE_ONE_CELL.py` into one Kaggle cell.
 
 ```python
-RUN = 1   # Exp-1
+RUN = 1   # Exp-1: Gaussian q-rung gate
 # then
-RUN = 2   # Exp-2
+RUN = 2   # Exp-2: plain gate control
 ```
 
-Settings: from scratch, `imgsz=1280`, `batch=16`, `patience=0`.
+- No Exp-0 baseline  
+- No Google Drive code  
+- From scratch, AdamW, `patience=0`  
+- Needs Kaggle Input with `annotations.zip`, `train2017.zip`, `val2017.zip`

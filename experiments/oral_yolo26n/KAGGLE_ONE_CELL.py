@@ -1,331 +1,212 @@
-# Paste this WHOLE file into ONE Kaggle notebook cell.
-# Run one experiment at a time by changing RUN, then re-run the cell.
+# ==========================================================================================
+# Oral detection — YOLO26n + neck gate
+# Paste into ONE Kaggle cell. Run Exp-1, then change RUN and run Exp-2.
 #
-# RUN = 1  -> Exp-1 proposed: Gaussian q-rung gate (learnable q)
-# RUN = 2  -> Exp-2 control: plain feature gate (no q)
+# RUN = 1  -> Exp-1: Gaussian q-rung gate (learnable q)     = proposed method
+# RUN = 2  -> Exp-2: plain Conv+sigmoid gate (no q)         = control
 #
-# No Exp-0 / plain YOLO26n baseline.
-# From scratch, patience=0.
+# Both: from scratch, same data/seed, no early stopping.
+# Dataset (Kaggle Input): annotations.zip, train2017.zip, val2017.zip
+# ==========================================================================================
 
-# ===================== SETTINGS =====================
-RUN = 1          # 1=q-rung proposed | 2=plain-gate control
+# -------------------- 1) SETTINGS --------------------
+RUN = 1                 # 1 = Exp-1 q-rung | 2 = Exp-2 plain gate
 IMGSZ = 1280
 EPOCHS = 100
-BATCH = 16
+BATCH = 4
 SEED = 0
+Q_INIT = 2.0            # start q (Pythagorean)
+LEARN_Q = True
+Q_MAX = 6.0
 
-# Confirm which Kaggle dataset slug you attached:
-KAGGLE_ROOT = "/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset"
-# KAGGLE_ROOT = "/kaggle/input/datasets/xainab22/oral-dataset/oral dataset"
+# Put your Kaggle dataset path here (whichever exists in Add Input)
+DATA_CANDIDATES = [
+    "/kaggle/input/datasets/xainab22/oral-dataset",
+    "/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset",
+]
+PASSWORD = "CVPR2024-OralXrays-9"   # zip password from OralXrays-9
 
-OUT_ROOT = "/kaggle/working/oral_yolo"
-CFG_DIR = "/kaggle/working/cfgs"
-RUNS = "/kaggle/working/runs"
+WORK = "/kaggle/working"
+RAW = f"{WORK}/raw"
+EXTRACT = f"{WORK}/extracted"
+YOLO_DATA = f"{WORK}/oral_yolo"
+RESULTS = f"{WORK}/results"
+RUNS = f"{WORK}/runs"
 
-# ===================== INSTALL =====================
+# -------------------- 2) INSTALL --------------------
 import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ultralytics", "pillow"])
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "ultralytics>=8.4", "pyzipper", "pyyaml", "pandas", "matplotlib"],
+    check=True,
+)
 
-# ===================== IMPORTS =====================
-import json, random, shutil, zipfile
+import json, math, os, random, shutil, zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pyzipper
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+import ultralytics
+import yaml
+from ultralytics import YOLO
 
-KAGGLE_ROOT = Path(KAGGLE_ROOT)
-OUT_ROOT = Path(OUT_ROOT)
-CFG_DIR = Path(CFG_DIR)
-RUNS = Path(RUNS)
-CFG_DIR.mkdir(parents=True, exist_ok=True)
-RUNS.mkdir(parents=True, exist_ok=True)
+print("Ultralytics", ultralytics.__version__, "| GPU:",
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
-# ===================== DATA PREP =====================
-CLASS_NAMES_FALLBACK = [
-    "Apical Periodontitis", "Decay", "Wisdom Tooth", "Missing Tooth",
-    "Dental Filling", "Root Canal Filling", "Implant", "Porcelain Crown", "Ceramic Bridge",
-]
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-def unzip_if_needed(zip_path, dest):
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    marker = dest / ".unzipped"
-    if marker.exists():
-        return
-    print("Unzipping", zip_path)
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(dest)
-    marker.write_text("ok")
+WORK, RAW, EXTRACT, YOLO_DATA, RESULTS, RUNS = map(Path, [WORK, RAW, EXTRACT, YOLO_DATA, RESULTS, RUNS])
+for p in (RAW, EXTRACT, YOLO_DATA, RESULTS, RUNS):
+    p.mkdir(parents=True, exist_ok=True)
 
-def find_coco_json(ann_dir, split):
-    hits = sorted(Path(ann_dir).rglob("*.json"))
-    preferred = [p for p in hits if split in p.name.lower()]
-    if preferred:
-        return preferred[0]
-    if hits:
-        return hits[0]
-    raise FileNotFoundError(ann_dir)
+# Find attached dataset folder
+DATASET = next((Path(p) for p in DATA_CANDIDATES if Path(p).exists()), None)
+if DATASET is None:
+    # fallback: search whole /kaggle/input for the three zips
+    hits = list(Path("/kaggle/input").rglob("annotations.zip"))
+    DATASET = hits[0].parent if hits else None
+assert DATASET is not None, "Attach oral dataset Input (annotations/train2017/val2017 zips)."
+print("Dataset folder:", DATASET)
 
-def find_image_dir(img_root, split):
-    img_root = Path(img_root)
-    direct = img_root / f"{split}2017"
-    if direct.is_dir():
-        return direct
-    for p in img_root.rglob("*"):
-        if p.is_dir() and split in p.name.lower():
-            return p
-    return img_root
+RUN_NAMES = {1: "exp1_qrof_gate", 2: "exp2_plain_gate"}
+YAML_FILES = {
+    1: WORK / "yolo26n_exp1_qrof.yaml",
+    2: WORK / "yolo26n_exp2_plain.yaml",
+}
+assert RUN in RUN_NAMES, "Set RUN to 1 or 2 only."
 
-def coco_to_yolo(coco_json, image_dir, label_dir, names):
-    """Convert COCO boxes to YOLO txt. Skips unknown category_id (e.g. id 0 not in categories)."""
-    label_dir = Path(label_dir)
-    label_dir.mkdir(parents=True, exist_ok=True)
-    data = json.loads(Path(coco_json).read_text())
-    cats = sorted(data["categories"], key=lambda c: c["id"])
-    id_to_idx = {c["id"]: i for i, c in enumerate(cats)}
-    names[:] = [c["name"] for c in cats]
-
-    images = {im["id"]: im for im in data["images"]}
-    anns_by_img = {i: [] for i in images}
-    skipped_cat = 0
-    for ann in data["annotations"]:
-        if ann.get("iscrowd", 0) == 1:
-            continue
-        if ann["category_id"] not in id_to_idx:
-            skipped_cat += 1
-            continue
-        anns_by_img[ann["image_id"]].append(ann)
-
-    n_ok = 0
-    for img_id, im in images.items():
-        file_name = im["file_name"]
-        src = Path(image_dir) / file_name
-        if not src.exists():
-            src = Path(image_dir) / Path(file_name).name
-        if not src.exists():
-            continue
-        w, h = im.get("width"), im.get("height")
-        if not w or not h:
-            with Image.open(src) as pic:
-                w, h = pic.size
-        lines = []
-        for ann in anns_by_img[img_id]:
-            x, y, bw, bh = ann["bbox"]
-            if bw <= 0 or bh <= 0:
-                continue
-            cx, cy, nw, nh = (x + bw / 2) / w, (y + bh / 2) / h, bw / w, bh / h
-            cls = id_to_idx[ann["category_id"]]
-            lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
-        (label_dir / f"{Path(file_name).stem}.txt").write_text(
-            "\n".join(lines) + ("\n" if lines else "")
-        )
-        n_ok += 1
-    print(f"coco_to_yolo: images={n_ok}, skipped_unknown_category_id={skipped_cat}")
-    return n_ok
-
-def link_images(image_dir, out_img_dir):
-    out_img_dir = Path(out_img_dir)
-    out_img_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for src in Path(image_dir).rglob("*"):
-        if src.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}:
-            continue
-        dst = out_img_dir / src.name
-        if not dst.exists():
-            try:
-                dst.symlink_to(src.resolve())
-            except OSError:
-                shutil.copy2(src, dst)
-        n += 1
-    return n
-
-def split_val_into_val_test(out_root: Path, seed: int = 0, test_ratio: float = 0.5):
-    """Hold out part of val as test so final score is not the same as model selection."""
-    rng = random.Random(seed)
-    img_val = out_root / "images/val"
-    lab_val = out_root / "labels/val"
-    img_test = out_root / "images/test"
-    lab_test = out_root / "labels/test"
-    img_test.mkdir(parents=True, exist_ok=True)
-    lab_test.mkdir(parents=True, exist_ok=True)
-
-    # If test already populated, keep it
-    existing = list(img_test.glob("*"))
-    if existing:
-        print("test split already exists:", len(existing))
-        return
-
-    stems = sorted({p.stem for p in lab_val.glob("*.txt")})
-    rng.shuffle(stems)
-    n_test = max(1, int(len(stems) * test_ratio))
-    test_stems = set(stems[:n_test])
-
-    moved = 0
-    for stem in test_stems:
-        for folder, dst_folder in (
-            (img_val, img_test),
-            (lab_val, lab_test),
-        ):
-            matches = list(folder.glob(stem + ".*"))
-            for src in matches:
-                dst = dst_folder / src.name
-                if src.exists():
-                    shutil.move(str(src), str(dst))
-                    moved += 1
-    print(f"Moved {len(test_stems)} images to test (files touched={moved})")
-
-assert KAGGLE_ROOT.exists(), f"Dataset not found: {KAGGLE_ROOT}"
-raw = OUT_ROOT / "_raw"
-unzip_if_needed(KAGGLE_ROOT / "annotations.zip", raw / "annotations")
-unzip_if_needed(KAGGLE_ROOT / "train2017.zip", raw / "train2017")
-unzip_if_needed(KAGGLE_ROOT / "val2017.zip", raw / "val2017")
-
-train_img = find_image_dir(raw / "train2017", "train")
-val_img = find_image_dir(raw / "val2017", "val")
-train_json = find_coco_json(raw / "annotations", "train")
-val_json = find_coco_json(raw / "annotations", "val")
-print("JSON/IMG", train_json, val_json, train_img, val_img)
-
-names = list(CLASS_NAMES_FALLBACK)
-print("train", coco_to_yolo(train_json, train_img, OUT_ROOT / "labels/train", names))
-print("val", coco_to_yolo(val_json, val_img, OUT_ROOT / "labels/val", names))
-print("train images", link_images(train_img, OUT_ROOT / "images/train"))
-print("val images", link_images(val_img, OUT_ROOT / "images/val"))
-split_val_into_val_test(OUT_ROOT, seed=SEED, test_ratio=0.5)
-
-data_yaml = OUT_ROOT / "oral.yaml"
-names_block = "\n".join(f"  {i}: {n}" for i, n in enumerate(names))
-data_yaml.write_text(
-    f"path: {OUT_ROOT.resolve()}\n"
-    f"train: images/train\n"
-    f"val: images/val\n"
-    f"test: images/test\n\n"
-    f"names:\n{names_block}\n"
-)
-print("DATA", data_yaml, "classes", names)
-
-# ===================== FUSION MODULES (Concat-compatible) =====================
-def _soft_sigma(raw, eps=1e-4):
-    return F.softplus(raw) + eps
+# -------------------- 3) GATE MODULES --------------------
+# Neck merge: two maps fa, fb -> gated concat (same shape as Concat: ca+cb channels)
+# Exp-1 gate from Gaussian q-rung score; Exp-2 gate from plain sigmoid.
+# gamma starts at 0 => first step equals plain Concat.
 
 
-class _CrossStreamGate(nn.Module):
-    """
-    Drop-in Concat replacement.
-    __init__(dimension=1) matches Ultralytics Concat.
-    Supports unequal channels via lazy init.
-    Output = cat(gated_a, gated_b) along dim — same rank as Concat.
-    Gate range is always ~[0, 2] via 2*sigmoid(...), init near 1 (identity).
-    """
+def soft_sigma(x, eps=1e-4):
+    return F.softplus(x) + eps
+
+
+class DualGateConcat(nn.Module):
+    """Replace Concat([fa, fb]). Builds 1x1 layers on first forward (when channels known)."""
 
     def __init__(self, dimension=1):
         super().__init__()
-        self.d = dimension
-        self._inited = False
-        self.logit_w = nn.Parameter(torch.tensor(0.0))  # stream mix weight
+        self.dim = dimension
+        self.ready = False
 
-    def _lazy_init(self, fa, fb):
-        ca, cb = fa.shape[1], fb.shape[1]
-        self.ev_a = nn.Conv2d(ca, 1, kernel_size=1, bias=True)
-        self.ev_b = nn.Conv2d(cb, 1, kernel_size=1, bias=True)
-        self.cha = nn.Conv2d(1, ca, kernel_size=1, bias=True)
-        self.chb = nn.Conv2d(1, cb, kernel_size=1, bias=True)
-        # bias 0 => 2*sigmoid(0)=1 => identity gate at start
-        nn.init.zeros_(self.ev_a.weight)
-        nn.init.zeros_(self.ev_b.weight)
-        nn.init.zeros_(self.ev_a.bias)
-        nn.init.zeros_(self.ev_b.bias)
-        nn.init.zeros_(self.cha.weight)
-        nn.init.zeros_(self.chb.weight)
-        nn.init.zeros_(self.cha.bias)
-        nn.init.zeros_(self.chb.bias)
-        self._init_extra(ca, cb)
-        self.to(fa.device)
-        self._inited = True
-
-    def _init_extra(self, ca, cb):
-        pass
-
-    def fused_evidence(self, fa, fb):
+    def make_gate_params(self, ca, cb):
         raise NotImplementedError
 
-    def forward(self, x):
-        if not isinstance(x, (list, tuple)) or len(x) < 2:
-            raise ValueError(f"{self.__class__.__name__} expects 2 feature maps")
-        fa, fb = x[0], x[1]
-        if not self._inited:
-            self._lazy_init(fa, fb)
-        S = self.fused_evidence(fa, fb)  # [B,1,H,W] in (~0,1) or logits->mapped inside
-        ga = 2.0 * torch.sigmoid(self.cha(S))
-        gb = 2.0 * torch.sigmoid(self.chb(S))
-        return torch.cat((fa * ga, fb * gb), self.d)
+    def compute_gates(self, ea, eb):
+        raise NotImplementedError
+
+    def build(self, fa, fb):
+        ca, cb = fa.shape[1], fb.shape[1]
+        self.proj_a = nn.Conv2d(ca, ca, 1, bias=False)
+        self.proj_b = nn.Conv2d(cb, cb, 1, bias=False)
+        self.out = nn.Conv2d(ca + cb, ca + cb, 1, bias=False)
+        self.gamma = nn.Parameter(torch.zeros(1))  # 0 => identity Concat
+        self.make_gate_params(ca, cb)
+        self.to(device=fa.device, dtype=torch.float32)
+        self.ready = True
+
+    def forward(self, xs):
+        fa, fb = xs
+        if not self.ready:
+            self.build(fa, fb)
+        ga, gb = self.compute_gates(self.proj_a(fa), self.proj_b(fb))
+        gated = torch.cat((fa * ga.to(fa.dtype), fb * gb.to(fb.dtype)), self.dim)
+        base = torch.cat((fa, fb), self.dim)
+        return base + self.gamma.to(base.dtype) * self.out(gated).to(base.dtype)
 
 
-class GqROFConcat(_CrossStreamGate):
-    """Exp-1: cross-stream Gaussian q-rung aggregation, then matched 2*sigmoid gate."""
+class GqROFConcat(DualGateConcat):
+    """Exp-1: Gaussian q-rung orthopair gate. YAML: [dim, q_init, learn_q, q_max]"""
 
-    def _init_extra(self, ca, cb):
-        self.c_mu = nn.Parameter(torch.zeros(1, 1, 1, 1))
-        self.c_nu = nn.Parameter(torch.zeros(1, 1, 1, 1))
-        self.s_mu = nn.Parameter(torch.ones(1, 1, 1, 1))
-        self.s_nu = nn.Parameter(torch.ones(1, 1, 1, 1))
-        self.rho = nn.Parameter(torch.tensor(-1.3863))  # q≈2
+    def __init__(self, dimension=1, q_init=2.0, learn_q=1, q_max=6.0):
+        super().__init__(dimension)
+        self.q_max = float(q_max)
+        # q = 1 + (q_max-1)*sigmoid(rho); choose rho so q starts at q_init
+        r = (float(q_init) - 1.0) / (self.q_max - 1.0)
+        rho0 = torch.tensor(math.log(r / (1.0 - r)))
+        if int(learn_q):
+            self.rho = nn.Parameter(rho0)
+        else:
+            self.register_buffer("rho", rho0)
 
-    def _orthopair(self, e):
-        q = 1.0 + 5.0 * torch.sigmoid(self.rho)
-        mu = torch.exp(-((e - self.c_mu) ** 2) / (2.0 * _soft_sigma(self.s_mu) ** 2)).clamp(1e-6, 1.0)
-        nu = (1.0 - mu.pow(q)).clamp(min=0.0).pow(1.0 / q) * torch.exp(
-            -((e - self.c_nu) ** 2) / (2.0 * _soft_sigma(self.s_nu) ** 2)
-        )
-        nu = nu.clamp(0.0, 1.0)
-        s = 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
-        return mu, nu, s
+    @property
+    def q(self):
+        return 1.0 + (self.q_max - 1.0) * torch.sigmoid(self.rho.float())
 
-    def fused_evidence(self, fa, fb):
-        ea = self.ev_a(fa)
-        eb = self.ev_b(fb)
-        mu_a, nu_a, _ = self._orthopair(ea)
-        mu_b, nu_b, _ = self._orthopair(eb)
-        w = torch.sigmoid(self.logit_w)
-        # Algebraic weighted mix of orthopair degrees, then score (cross-stream fusion)
-        mu = w * mu_a + (1.0 - w) * mu_b
-        nu = w * nu_a + (1.0 - w) * nu_b
-        q = 1.0 + 5.0 * torch.sigmoid(self.rho)
-        # Renormalize lightly to keep numerical stability inside orthopair ball
-        norm = (mu.pow(q) + nu.pow(q)).clamp(min=1e-6)
-        scale = torch.clamp(norm, max=1.0) / norm
-        mu = (mu * scale.pow(1.0 / q)).clamp(1e-6, 1.0)
-        nu = (nu * scale.pow(1.0 / q)).clamp(0.0, 1.0)
-        S = 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
-        return S
+    def make_gate_params(self, ca, cb):
+        for tag, c in (("a", ca), ("b", cb)):
+            for name, val in (("c_mu", 0.0), ("c_nu", 0.0), ("s_mu", 1.0), ("s_nu", 1.0)):
+                setattr(self, f"{name}_{tag}", nn.Parameter(torch.full((1, c, 1, 1), val)))
 
+    def score(self, e, tag):
+        e = e.float()
+        q = self.q
+        get = lambda n: getattr(self, f"{n}_{tag}").float()
+        mu = torch.exp(-((e - get("c_mu")) ** 2) / (2 * soft_sigma(get("s_mu")) ** 2)).clamp(1e-6, 1)
+        nu = (1.0 - mu.pow(q)).clamp(min=0).pow(1.0 / q)
+        nu = nu * torch.exp(-((e - get("c_nu")) ** 2) / (2 * soft_sigma(get("s_nu")) ** 2))
+        nu = nu.clamp(0, 1)
+        # score in [0,1]; gate = 0.5 + score => [0.5, 1.5]
+        return 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
 
-class PlainGateConcat(_CrossStreamGate):
-    """Exp-2 Control A: same cross-stream mix + 2*sigmoid gates, no q-rung."""
-
-    def fused_evidence(self, fa, fb):
-        ea = self.ev_a(fa)
-        eb = self.ev_b(fb)
-        w = torch.sigmoid(self.logit_w)
-        # Map mixed evidence to (0,1) so cha/chb see same scale family as S
-        return torch.sigmoid(w * ea + (1.0 - w) * eb)
+    def compute_gates(self, ea, eb):
+        with torch.autocast(device_type=ea.device.type, enabled=False):
+            return 0.5 + self.score(ea, "a"), 0.5 + self.score(eb, "b")
 
 
-# ===================== BUILD OFFICIAL YOLO26n + REPLACE CONCAT =====================
-YOLO26_YAML = f"""
-# Official YOLO26 topology; nc=9 for oral dataset. Concat kept on purpose.
-nc: {len(names)}
+class PlainGateConcat(DualGateConcat):
+    """Exp-2: plain gate, no q. Same residual / same gate range as Exp-1."""
+
+    def make_gate_params(self, ca, cb):
+        self.gate_a = nn.Conv2d(ca, ca, 1)
+        self.gate_b = nn.Conv2d(cb, cb, 1)
+
+    def compute_gates(self, ea, eb):
+        return 0.5 + torch.sigmoid(self.gate_a(ea)), 0.5 + torch.sigmoid(self.gate_b(eb))
+
+
+def register_gate(run):
+    """Tell Ultralytics about our modules. Also alias Concat so channel math stays ca+cb."""
+    import ultralytics.nn.tasks as tasks
+
+    tasks.GqROFConcat = GqROFConcat
+    tasks.PlainGateConcat = PlainGateConcat
+    tasks.Concat = GqROFConcat if run == 1 else PlainGateConcat
+
+
+def unregister_gate():
+    import ultralytics.nn.tasks as tasks
+    from ultralytics.nn.modules import Concat
+
+    tasks.Concat = Concat
+    for name in ("GqROFConcat", "PlainGateConcat"):
+        if hasattr(tasks, name):
+            delattr(tasks, name)
+
+
+def gate_layers(model):
+    return [m for m in model.modules() if isinstance(m, DualGateConcat)]
+
+
+# -------------------- 4) MODEL YAML (YOLO26n, only merge row differs) --------------------
+YAML_BODY = """# YOLO26n oral | {title}
+nc: 9
 end2end: True
 reg_max: 1
 scale: n
 scales:
   n: [0.50, 0.25, 1024]
-  s: [0.50, 0.50, 1024]
-  m: [0.50, 1.00, 512]
-  l: [1.00, 1.00, 512]
-  x: [1.00, 1.50, 512]
 
 backbone:
   - [-1, 1, Conv, [64, 3, 2]]
@@ -342,91 +223,270 @@ backbone:
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, Concat, [1]]
+  - [[-1, 6], 1, {merge}]
   - [-1, 2, C3k2, [512, True]]
-
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, Concat, [1]]
+  - [[-1, 4], 1, {merge}]
   - [-1, 2, C3k2, [256, True]]
-
   - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 13], 1, Concat, [1]]
+  - [[-1, 13], 1, {merge}]
   - [-1, 2, C3k2, [512, True]]
-
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 10], 1, Concat, [1]]
+  - [[-1, 10], 1, {merge}]
   - [-1, 1, C3k2, [1024, True, 0.5, True]]
-
   - [[16, 19, 22], 1, Detect, [nc]]
-""".lstrip()
+"""
 
-yaml_path = CFG_DIR / "yolo26n_oral.yaml"
-yaml_path.write_text(YOLO26_YAML)
-
-from ultralytics import YOLO
-from ultralytics.nn.modules import Concat
-
-def copy_ultralytics_meta(dst, src):
-    for key in ("f", "i", "type", "np"):
-        if hasattr(src, key):
-            setattr(dst, key, getattr(src, key))
-    return dst
-
-def replace_concats(model, mode: int) -> int:
-    """Replace Ultralytics Concat with gated fusion. mode=1 q-rung, mode=2 plain."""
-    seq = model.model.model  # nn.Sequential of DetectionModel
-    n = 0
-    for i, layer in enumerate(seq):
-        if isinstance(layer, Concat):
-            dim = getattr(layer, "d", 1)
-            new = GqROFConcat(dimension=dim) if mode == 1 else PlainGateConcat(dimension=dim)
-            seq[i] = copy_ultralytics_meta(new, layer)
-            n += 1
-    return n
-
-def smoke_forward(model):
-    model.model.eval()
-    x = torch.zeros(1, 3, 640, 640)
-    with torch.no_grad():
-        _ = model.model(x)
-    print("smoke_forward OK")
-
-run_names = {
-    1: "exp1_qrof_gate",
-    2: "exp2_plain_gate",
+merge_rows = {
+    1: f"GqROFConcat, [1, {Q_INIT}, {int(LEARN_Q)}, {Q_MAX}]",
+    2: "PlainGateConcat, [1]",
 }
-assert RUN in run_names, "RUN must be 1 or 2"
+titles = {1: "Exp-1 q-rung gate", 2: "Exp-2 plain gate"}
+for r, path in YAML_FILES.items():
+    path.write_text(YAML_BODY.format(title=titles[r], merge=merge_rows[r]), encoding="utf-8")
+print("YAML ready:", YAML_FILES[RUN].name)
 
-print(f"Building YOLO26n + gate (from scratch), RUN={RUN} ({run_names[RUN]})")
-model = YOLO(str(yaml_path))  # architecture only — NO pretrained load
-n_rep = replace_concats(model, RUN)
-print(f"Replaced {n_rep} Concat modules")
-smoke_forward(model)
+# -------------------- 5) DATA: unzip + COCO -> YOLO --------------------
+
+def find_zips():
+    """Find annotations / train2017 / val2017 zip under dataset or /kaggle/input."""
+    need = {"annotations", "train2017", "val2017"}
+    found = {}
+    roots = [DATASET, Path("/kaggle/input"), RAW]
+    for root in roots:
+        if not root.exists():
+            continue
+        for z in root.rglob("*.zip"):
+            stem = z.stem
+            if stem in need and stem not in found:
+                found[stem] = z
+    missing = need - set(found)
+    assert not missing, f"Missing zips: {sorted(missing)}"
+    return found
+
+
+def unzip_all(zips):
+    for name, zpath in zips.items():
+        out = EXTRACT / name
+        if out.exists() and any(out.iterdir()):
+            continue
+        print("Extracting", zpath)
+        out.mkdir(parents=True, exist_ok=True)
+        try:
+            with pyzipper.AESZipFile(zpath) as zf:
+                zf.setpassword(PASSWORD.encode())
+                zf.extractall(out)
+        except Exception:
+            with zipfile.ZipFile(zpath) as zf:
+                zf.extractall(out)
+
+
+def coco_to_records():
+    """Read COCO jsons -> list of dict(img, boxes, is_test). Official val = TEST."""
+    # index images by filename
+    by_name = defaultdict(list)
+    for p in EXTRACT.rglob("*"):
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
+            by_name[p.name].append(p)
+    # also search input if images already unpacked
+    for p in Path("/kaggle/input").rglob("*"):
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
+            by_name[p.name].append(p)
+
+    records, class_names, name_to_idx = [], None, None
+    for jpath in sorted(EXTRACT.rglob("*.json")):
+        data = json.loads(jpath.read_text(encoding="utf-8"))
+        if not {"images", "annotations", "categories"} <= set(data):
+            continue
+        if class_names is None:
+            cats = sorted(data["categories"], key=lambda c: c["id"])
+            class_names = [c["name"] for c in cats]
+            name_to_idx = {c["name"]: i for i, c in enumerate(cats)}
+        id_to_name = {c["id"]: c["name"] for c in data["categories"]}
+        anns = defaultdict(list)
+        for a in data["annotations"]:
+            anns[a["image_id"]].append(a)
+
+        tag = jpath.stem.lower().replace("instances_", "")
+        is_test = ("val" in tag) or ("test" in tag)
+
+        for im in data["images"]:
+            cands = by_name.get(Path(im["file_name"]).name, [])
+            if len(cands) > 1:
+                cands = [c for c in cands if tag in [x.lower() for x in c.parts]] or cands
+            if not cands:
+                continue
+            W, H = im["width"], im["height"]
+            boxes = []
+            for a in anns[im["id"]]:
+                cname = id_to_name.get(a["category_id"])
+                if cname not in name_to_idx:  # skip unknown ids (e.g. category_id 0)
+                    continue
+                x, y, w, h = a["bbox"]
+                x0, y0 = max(0, x), max(0, y)
+                x1, y1 = min(W, x + w), min(H, y + h)
+                if x1 - x0 < 1 or y1 - y0 < 1:
+                    continue
+                boxes.append(
+                    (
+                        name_to_idx[cname],
+                        (x0 + x1) / 2 / W,
+                        (y0 + y1) / 2 / H,
+                        (x1 - x0) / W,
+                        (y1 - y0) / H,
+                    )
+                )
+            records.append(dict(img=cands[0], boxes=boxes, is_test=is_test))
+
+    assert records and class_names, "No COCO records found after extract."
+    assert len(class_names) == 9, f"Expected 9 classes, got {class_names}"
+    return records, class_names
+
+
+def write_yolo_dataset(records, class_names):
+    """Train = 90% of train2017, Val = 10% of train2017, Test = official val2017."""
+    rng = random.Random(42)
+    trainval = [r for r in records if not r["is_test"]]
+    test = [r for r in records if r["is_test"]]
+    rng.shuffle(trainval)
+    n_val = max(1, int(0.10 * len(trainval)))
+    splits = {"val": trainval[:n_val], "train": trainval[n_val:], "test": test}
+
+    if YOLO_DATA.exists():
+        shutil.rmtree(YOLO_DATA)
+    for split, recs in splits.items():
+        (YOLO_DATA / "images" / split).mkdir(parents=True)
+        (YOLO_DATA / "labels" / split).mkdir(parents=True)
+        for i, r in enumerate(recs):
+            stem = f"{i:05d}_{r['img'].stem}".replace(" ", "_")
+            dst = YOLO_DATA / "images" / split / (stem + r["img"].suffix.lower())
+            try:
+                os.symlink(r["img"].resolve(), dst)
+            except OSError:
+                shutil.copy2(r["img"], dst)
+            lines = [f"{c} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}" for c, xc, yc, w, h in r["boxes"]]
+            (YOLO_DATA / "labels" / split / f"{stem}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+
+    data_yaml = YOLO_DATA / "data.yaml"
+    data_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "path": str(YOLO_DATA),
+                "train": "images/train",
+                "val": "images/val",
+                "test": "images/test",
+                "nc": len(class_names),
+                "names": {i: n for i, n in enumerate(class_names)},
+            },
+            sort_keys=False,
+        )
+    )
+    print({k: len(v) for k, v in splits.items()})
+    counts = {s: Counter(b[0] for r in recs for b in r["boxes"]) for s, recs in splits.items()}
+    print(pd.DataFrame(counts, index=range(len(class_names))).fillna(0).astype(int).assign(name=class_names))
+    return data_yaml
+
+
+print("Preparing data...")
+unzip_all(find_zips())
+records, CLASS_NAMES = coco_to_records()
+DATA_YAML = write_yolo_dataset(records, CLASS_NAMES)
+
+# -------------------- 6) TRAIN (from scratch) --------------------
+name = RUN_NAMES[RUN]
+print(f"\n===== TRAIN {name} | imgsz={IMGSZ} batch={BATCH} epochs={EPOCHS} scratch =====")
+
+unregister_gate()
+register_gate(RUN)
+model = YOLO(str(YAML_FILES[RUN]))
+
+# Log gamma / q each epoch for Exp-1
+history = []
+
+
+def on_epoch_end(trainer):
+    m = getattr(trainer.model, "module", trainer.model)
+    row = {"epoch": trainer.epoch + 1}
+    for i, layer in enumerate(gate_layers(m)):
+        row[f"gamma{i}"] = float(layer.gamma.detach())
+        if isinstance(layer, GqROFConcat):
+            row[f"q{i}"] = float(layer.q.detach())
+    history.append(row)
+
+
+def on_train_end(trainer):
+    if not history:
+        return
+    df = pd.DataFrame(history)
+    df.to_csv(RESULTS / f"{name}_history.csv", index=False)
+    qcols = [c for c in df.columns if c.startswith("q")]
+    if qcols:
+        df.plot(x="epoch", y=qcols, figsize=(7, 3), title=f"learned q ({name})")
+        plt.tight_layout()
+        plt.savefig(RESULTS / f"{name}_q.png", dpi=150)
+        plt.close()
+        print("final q:", {c: round(float(df[c].iloc[-1]), 4) for c in qcols})
+    print("final gamma:", {c: round(float(df[c].iloc[-1]), 4) for c in df.columns if c.startswith("gamma")})
+
+
+model.add_callback("on_train_epoch_end", on_epoch_end)
+model.add_callback("on_train_end", on_train_end)
 
 model.train(
-    data=str(data_yaml),
-    imgsz=IMGSZ,
+    data=str(DATA_YAML),
+    name=name,
+    project=str(RUNS),
     epochs=EPOCHS,
+    imgsz=IMGSZ,
     batch=BATCH,
     seed=SEED,
-    workers=2,
-    project=str(RUNS),
-    name=run_names[RUN],
-    optimizer="auto",
+    optimizer="AdamW",
+    lr0=0.001,
     patience=0,
     pretrained=False,
-    save=True,
+    deterministic=True,
+    workers=2,
+    exist_ok=True,
     plots=True,
 )
-print("TRAIN DONE:", RUNS / run_names[RUN])
+unregister_gate()
+print("TRAIN DONE:", RUNS / name)
 
-# Final score on held-out test (not used for early stopping — patience=0 anyway)
-best = RUNS / run_names[RUN] / "weights" / "best.pt"
-if best.exists():
+# -------------------- 7) TEST EVAL (all finished runs) --------------------
+rows, per_class = [], {}
+for r, rname in RUN_NAMES.items():
+    best = RUNS / rname / "weights" / "best.pt"
+    if not best.exists():
+        print("no weights yet:", rname)
+        continue
+    unregister_gate()
+    register_gate(r)
     m = YOLO(str(best))
-    print("TEST metrics:")
-    m.val(data=str(data_yaml), split="test", imgsz=IMGSZ, plots=False)
+    res = m.val(data=str(DATA_YAML), split="test", imgsz=IMGSZ, batch=BATCH, plots=False, verbose=False)
+    qs = [round(float(g.q.detach()), 4) for g in gate_layers(m.model) if isinstance(g, GqROFConcat)]
+    rows.append(
+        dict(
+            model=rname,
+            precision=float(res.box.mp),
+            recall=float(res.box.mr),
+            mAP50=float(res.box.map50),
+            mAP50_95=float(res.box.map),
+            learned_q=qs or None,
+        )
+    )
+    per_class[rname] = pd.Series(res.box.maps, index=CLASS_NAMES)
+unregister_gate()
 
-# One-by-one:
-# 1) RUN=1 proposed q-rung
-# 2) RUN=2 plain-gate control
+if rows:
+    summary = pd.DataFrame(rows).set_index("model")
+    print(summary.round(4))
+    summary.to_csv(RESULTS / "summary_test.csv")
+    pc = pd.DataFrame(per_class).round(4)
+    print(pc)
+    pc.to_csv(RESULTS / "per_class_ap50_95.csv")
+    pc.plot.bar(figsize=(10, 4), title="Per-class AP50-95 (test)")
+    plt.tight_layout()
+    plt.savefig(RESULTS / "per_class_ap.png", dpi=150)
+    plt.show()
+
+print("\nNext: set RUN = 2 and run this cell again." if RUN == 1 else "\nBoth runs ready if Exp-1 weights exist.")
