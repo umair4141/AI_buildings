@@ -11,9 +11,10 @@
 
 # -------------------- 1) SETTINGS --------------------
 RUN = 1                 # 1 = Exp-1 q-rung | 2 = Exp-2 plain gate
-IMGSZ = 1280
+IMGSZ = 1280            # keep near OralXrays-9 (1333x800); do NOT pair with batch 16 on Kaggle 16GB
 EPOCHS = 100
-BATCH = 16
+BATCH = 4               # Kaggle T4/P100 ~16GB: batch 16 @ 1280 fp32 OOMs; use 4 (or 2 if still OOM)
+AMP = True              # mixed precision; set False only if you must stay full fp32 (uses much more VRAM)
 SEED = 0
 Q_INIT = 2.0            # start q (Pythagorean)
 LEARN_Q = True
@@ -445,7 +446,9 @@ model.train(
     patience=0,
     pretrained=False,
     deterministic=True,
+    amp=AMP,            # True = fp16 activations (saves VRAM); gate fuzzy math still runs in fp32
     workers=2,
+    cache=False,
     exist_ok=True,
     plots=True,
 )
