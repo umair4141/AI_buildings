@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import zipfile
 from pathlib import Path
@@ -88,8 +89,12 @@ def coco_to_yolo(coco_json: Path, image_dir: Path, label_dir: Path, names: list[
 
     images = {im["id"]: im for im in data["images"]}
     anns_by_img: dict[int, list] = {i: [] for i in images}
+    skipped_cat = 0
     for ann in data["annotations"]:
         if ann.get("iscrowd", 0) == 1:
+            continue
+        if ann["category_id"] not in id_to_idx:
+            skipped_cat += 1
             continue
         anns_by_img[ann["image_id"]].append(ann)
 
@@ -124,6 +129,7 @@ def coco_to_yolo(coco_json: Path, image_dir: Path, label_dir: Path, names: list[
         stem = Path(file_name).stem
         (label_dir / f"{stem}.txt").write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
+    print(f"skipped_unknown_category_id={skipped_cat}")
     return names
 
 
@@ -141,6 +147,27 @@ def link_or_copy_images(image_dir: Path, out_img_dir: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def split_val_into_val_test(out_root: Path, seed: int = 0, test_ratio: float = 0.5) -> None:
+    rng = random.Random(seed)
+    img_val, lab_val = out_root / "images/val", out_root / "labels/val"
+    img_test, lab_test = out_root / "images/test", out_root / "labels/test"
+    img_test.mkdir(parents=True, exist_ok=True)
+    lab_test.mkdir(parents=True, exist_ok=True)
+    if any(img_test.iterdir()):
+        return
+    stems = sorted({p.stem for p in lab_val.glob("*.txt")})
+    rng.shuffle(stems)
+    test_stems = set(stems[: max(1, int(len(stems) * test_ratio))])
+    for stem in test_stems:
+        for src in list(img_val.glob(stem + ".*")) + list(lab_val.glob(stem + ".*")):
+            dst_dir = img_test if src.parent.name == "val" and src.suffix.lower() != ".txt" else lab_test
+            if src.suffix.lower() == ".txt":
+                dst_dir = lab_test
+            else:
+                dst_dir = img_test
+            shutil.move(str(src), str(dst_dir / src.name))
+
+
 def write_data_yaml(out_root: Path, names: list[str]) -> Path:
     yaml_path = out_root / "oral.yaml"
     names_block = "\n".join(f"  {i}: {n}" for i, n in enumerate(names))
@@ -148,6 +175,7 @@ def write_data_yaml(out_root: Path, names: list[str]) -> Path:
 path: {out_root.resolve()}
 train: images/train
 val: images/val
+test: images/test
 
 names:
 {names_block}
@@ -185,6 +213,7 @@ def main() -> None:
 
     link_or_copy_images(train_img, out / "images/train")
     link_or_copy_images(val_img, out / "images/val")
+    split_val_into_val_test(out, seed=0, test_ratio=0.5)
 
     yaml_path = write_data_yaml(out, names)
     print(f"Done. Dataset YAML: {yaml_path}")

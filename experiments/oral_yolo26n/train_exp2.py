@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exp-2: YOLO26n + PlainGateConcat (no q-rung)."""
+"""Exp-2: YOLO26n + PlainGateConcat (matched control A, no q)."""
 
 from pathlib import Path
 import sys
@@ -11,5 +11,4 @@ if str(ROOT) not in sys.path:
 from experiments.oral_yolo26n.train_common import train
 
 if __name__ == "__main__":
-    cfg = ROOT / "experiments/oral_yolo26n/configs/yolo26n_exp2_plain_gate.yaml"
-    train(cfg, run_name="exp2_plain_gate")
+    train(run=2, run_name="exp2_plain_gate")

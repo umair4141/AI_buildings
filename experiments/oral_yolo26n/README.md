@@ -1,81 +1,36 @@
-# Two YOLO26n experiments (OralXrays-9 style)
+# YOLO26n oral experiments (fixed)
 
-**Dataset (Kaggle):**
-```text
-/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset/
-  README (3).md
-  annotations.zip
-  train2017.zip
-  val2017.zip
+## Runs (one by one)
+
+| RUN | Name | What |
+|---|---|---|
+| **0** | `exp0_yolo26n_baseline` | Official YOLO26n `Concat` |
+| **1** | `exp1_qrof_gate` | Cross-stream **Gaussian q-rung** gate (learnable \(q\)) |
+| **2** | `exp2_plain_gate` | Matched **plain** cross-stream gate (`2*sigmoid`, no \(q\)) |
+
+## Kaggle one cell
+
+Paste `KAGGLE_ONE_CELL.py`, then:
+
+```python
+RUN = 0   # then 1, then 2
 ```
 
-**Model base:** official Ultralytics `yolo26n.yaml` (P3/P4/P5 Detect, `end2end: True`, `reg_max: 1`).
+Settings: `imgsz=1280`, `batch=16`, `optimizer="auto"`, `patience=0`, **from scratch** (no `yolo26n.pt`).
 
-**Image size:** `imgsz=1280` (closest square setting to OralXrays-9 paper size **1333×800**).
+## Fixes included
 
----
+- Skip unknown `category_id` (no `KeyError: 0`)
+- Build official YAML with `Concat`, then **replace** Concat modules (no broken `parse_model` / `base_modules` hack)
+- Unequal merge channels via lazy init; output is `cat` like Concat
+- Cross-stream aggregation (not per-stream-only gate)
+- Matched gate range `[0, 2]` for Exp-1 and Exp-2
+- Val→test holdout for final score
 
-## Exp-1 — Proposed (q-rung gated fusion)
+## Dataset path
 
-| Item | Value |
-|---|---|
-| Name | `exp1_qrof_gate` |
-| YAML | `configs/yolo26n_exp1_qrof.yaml` |
-| What | YOLO26n neck Concat → **GqROFConcat** (Gaussian q-rung gate, **learnable q** per merge) |
-| Goal | Measure q-rung fuzzy gate |
+Default in one-cell:
 
-```bash
-python experiments/oral_yolo26n/train_exp1.py
-```
+`/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset`
 
----
-
-## Exp-2 — Plain feature gate (control A)
-
-| Item | Value |
-|---|---|
-| Name | `exp2_plain_gate` |
-| YAML | `configs/yolo26n_exp2_plain_gate.yaml` |
-| What | Same merge points → **PlainGateConcat** (gate from projected features only; **no μ/ν/π, no q**) |
-| Goal | Isolate whether gain is from **gate** or from **q-rung** |
-
-```bash
-python experiments/oral_yolo26n/train_exp2.py
-```
-
----
-
-## Keep identical across both runs
-
-- YOLO26n scale  
-- `imgsz=1280`  
-- same prepared YOLO labels  
-- same epochs / batch / seed (`seed=0`)  
-- same 4 merge locations in the neck  
-
-**Only difference:** q-rung fuzzy gate vs plain feature gate.
-
----
-
-## How to read results
-
-| Outcome | Meaning |
-|---|---|
-| Exp-1 ≫ Exp-2 | q-rung helps |
-| Exp-1 ≈ Exp-2 | only the gate helps |
-| Exp-1 < Exp-2 | q-rung unstable / not helping |
-
-Report: mAP50, mAP50-95, AP for **Decay** and **Apical Periodontitis**.
-
----
-
-## Prepare data once (Kaggle)
-
-```bash
-python experiments/oral_yolo26n/prepare_kaggle_data.py
-```
-
-Writes under `/kaggle/working/oral_yolo/`:
-- `images/train`, `images/val`
-- `labels/train`, `labels/val`
-- `oral.yaml`
+If your slug is different, change `KAGGLE_ROOT`.

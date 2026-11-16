@@ -1,14 +1,29 @@
 # Paste this WHOLE file into ONE Kaggle notebook cell.
-# Then run Exp-1 and Exp-2 one-by-one by setting RUN = 1 or RUN = 2 at the bottom.
+# Run one experiment at a time by changing RUN, then re-run the cell.
+#
+# RUN = 0  -> plain YOLO26n baseline (official Concat, from scratch)
+# RUN = 1  -> Exp-1 proposed: cross-stream Gaussian q-rung gated fusion (learnable q)
+# RUN = 2  -> Exp-2 control A: same gate net, plain features, matched 2*sigmoid range
+#
+# Fixes vs previous broken cell:
+# - skip unknown COCO category_id (fixes KeyError 0)
+# - build official YOLO26n YAML with Concat, then REPLACE Concat modules (no broken parse_model hack)
+# - unequal merge channels supported (lazy init); output is cat like Concat
+# - from scratch (no yolo26n.pt load)
+# - optimizer=auto, patience=0, batch=16
+# - val/test split from official val2017
 
 # ===================== SETTINGS =====================
-RUN = 1          # 1 = Exp-1 q-rung | 2 = Exp-2 plain gate | 0 = prepare only
+RUN = 0          # 0=baseline | 1=q-rung proposed | 2=plain-gate control
 IMGSZ = 1280
 EPOCHS = 100
 BATCH = 16
 SEED = 0
 
+# Confirm which Kaggle dataset slug you attached:
 KAGGLE_ROOT = "/kaggle/input/datasets/xxccfffffffffff/oral-dataset/oral dataset"
+# KAGGLE_ROOT = "/kaggle/input/datasets/xainab22/oral-dataset/oral dataset"
+
 OUT_ROOT = "/kaggle/working/oral_yolo"
 CFG_DIR = "/kaggle/working/cfgs"
 RUNS = "/kaggle/working/runs"
@@ -18,7 +33,7 @@ import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "ultralytics", "pillow"])
 
 # ===================== IMPORTS =====================
-import copy, json, shutil, zipfile
+import json, random, shutil, zipfile
 from pathlib import Path
 
 import torch
@@ -40,7 +55,8 @@ CLASS_NAMES_FALLBACK = [
 ]
 
 def unzip_if_needed(zip_path, dest):
-    dest = Path(dest); dest.mkdir(parents=True, exist_ok=True)
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
     marker = dest / ".unzipped"
     if marker.exists():
         return
@@ -51,9 +67,9 @@ def unzip_if_needed(zip_path, dest):
 
 def find_coco_json(ann_dir, split):
     hits = sorted(Path(ann_dir).rglob("*.json"))
-    for p in hits:
-        if split in p.name.lower():
-            return p
+    preferred = [p for p in hits if split in p.name.lower()]
+    if preferred:
+        return preferred[0]
     if hits:
         return hits[0]
     raise FileNotFoundError(ann_dir)
@@ -69,17 +85,25 @@ def find_image_dir(img_root, split):
     return img_root
 
 def coco_to_yolo(coco_json, image_dir, label_dir, names):
-    label_dir = Path(label_dir); label_dir.mkdir(parents=True, exist_ok=True)
+    """Convert COCO boxes to YOLO txt. Skips unknown category_id (e.g. id 0 not in categories)."""
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
     data = json.loads(Path(coco_json).read_text())
     cats = sorted(data["categories"], key=lambda c: c["id"])
     id_to_idx = {c["id"]: i for i, c in enumerate(cats)}
     names[:] = [c["name"] for c in cats]
+
     images = {im["id"]: im for im in data["images"]}
     anns_by_img = {i: [] for i in images}
+    skipped_cat = 0
     for ann in data["annotations"]:
         if ann.get("iscrowd", 0) == 1:
             continue
+        if ann["category_id"] not in id_to_idx:
+            skipped_cat += 1
+            continue
         anns_by_img[ann["image_id"]].append(ann)
+
     n_ok = 0
     for img_id, im in images.items():
         file_name = im["file_name"]
@@ -98,13 +122,18 @@ def coco_to_yolo(coco_json, image_dir, label_dir, names):
             if bw <= 0 or bh <= 0:
                 continue
             cx, cy, nw, nh = (x + bw / 2) / w, (y + bh / 2) / h, bw / w, bh / h
-            lines.append(f"{id_to_idx[ann['category_id']]} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
-        (label_dir / f"{Path(file_name).stem}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+            cls = id_to_idx[ann["category_id"]]
+            lines.append(f"{cls} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
+        (label_dir / f"{Path(file_name).stem}.txt").write_text(
+            "\n".join(lines) + ("\n" if lines else "")
+        )
         n_ok += 1
+    print(f"coco_to_yolo: images={n_ok}, skipped_unknown_category_id={skipped_cat}")
     return n_ok
 
 def link_images(image_dir, out_img_dir):
-    out_img_dir = Path(out_img_dir); out_img_dir.mkdir(parents=True, exist_ok=True)
+    out_img_dir = Path(out_img_dir)
+    out_img_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for src in Path(image_dir).rglob("*"):
         if src.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}:
@@ -118,7 +147,42 @@ def link_images(image_dir, out_img_dir):
         n += 1
     return n
 
-assert KAGGLE_ROOT.exists(), KAGGLE_ROOT
+def split_val_into_val_test(out_root: Path, seed: int = 0, test_ratio: float = 0.5):
+    """Hold out part of val as test so final score is not the same as model selection."""
+    rng = random.Random(seed)
+    img_val = out_root / "images/val"
+    lab_val = out_root / "labels/val"
+    img_test = out_root / "images/test"
+    lab_test = out_root / "labels/test"
+    img_test.mkdir(parents=True, exist_ok=True)
+    lab_test.mkdir(parents=True, exist_ok=True)
+
+    # If test already populated, keep it
+    existing = list(img_test.glob("*"))
+    if existing:
+        print("test split already exists:", len(existing))
+        return
+
+    stems = sorted({p.stem for p in lab_val.glob("*.txt")})
+    rng.shuffle(stems)
+    n_test = max(1, int(len(stems) * test_ratio))
+    test_stems = set(stems[:n_test])
+
+    moved = 0
+    for stem in test_stems:
+        for folder, dst_folder in (
+            (img_val, img_test),
+            (lab_val, lab_test),
+        ):
+            matches = list(folder.glob(stem + ".*"))
+            for src in matches:
+                dst = dst_folder / src.name
+                if src.exists():
+                    shutil.move(str(src), str(dst))
+                    moved += 1
+    print(f"Moved {len(test_stems)} images to test (files touched={moved})")
+
+assert KAGGLE_ROOT.exists(), f"Dataset not found: {KAGGLE_ROOT}"
 raw = OUT_ROOT / "_raw"
 unzip_if_needed(KAGGLE_ROOT / "annotations.zip", raw / "annotations")
 unzip_if_needed(KAGGLE_ROOT / "train2017.zip", raw / "train2017")
@@ -131,131 +195,134 @@ val_json = find_coco_json(raw / "annotations", "val")
 print("JSON/IMG", train_json, val_json, train_img, val_img)
 
 names = list(CLASS_NAMES_FALLBACK)
-print("train labels", coco_to_yolo(train_json, train_img, OUT_ROOT / "labels/train", names))
-print("val labels", coco_to_yolo(val_json, val_img, OUT_ROOT / "labels/val", names))
+print("train", coco_to_yolo(train_json, train_img, OUT_ROOT / "labels/train", names))
+print("val", coco_to_yolo(val_json, val_img, OUT_ROOT / "labels/val", names))
 print("train images", link_images(train_img, OUT_ROOT / "images/train"))
 print("val images", link_images(val_img, OUT_ROOT / "images/val"))
+split_val_into_val_test(OUT_ROOT, seed=SEED, test_ratio=0.5)
 
 data_yaml = OUT_ROOT / "oral.yaml"
 names_block = "\n".join(f"  {i}: {n}" for i, n in enumerate(names))
-data_yaml.write_text(f"path: {OUT_ROOT.resolve()}\ntrain: images/train\nval: images/val\n\nnames:\n{names_block}\n")
+data_yaml.write_text(
+    f"path: {OUT_ROOT.resolve()}\n"
+    f"train: images/train\n"
+    f"val: images/val\n"
+    f"test: images/test\n\n"
+    f"names:\n{names_block}\n"
+)
 print("DATA", data_yaml, "classes", names)
 
-# ===================== MODULES =====================
-
+# ===================== FUSION MODULES (Concat-compatible) =====================
 def _soft_sigma(raw, eps=1e-4):
     return F.softplus(raw) + eps
 
-class _BaseDualGate(nn.Module):
-    def __init__(self, c1, c2=None):
-        super().__init__()
-        self.c = int(c1) if c2 is None else int(c2)
-        if c2 is None and c1 % 2 == 0:
-            self.c = c1 // 2
-        self.proj_a = nn.Conv2d(self.c, self.c, 1, bias=False)
-        self.proj_b = nn.Conv2d(self.c, self.c, 1, bias=False)
-        self.out = nn.Conv2d(2 * self.c, 2 * self.c, 1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
 
-    def gate_from_evidence(self, ea, eb):
+class _CrossStreamGate(nn.Module):
+    """
+    Drop-in Concat replacement.
+    __init__(dimension=1) matches Ultralytics Concat.
+    Supports unequal channels via lazy init.
+    Output = cat(gated_a, gated_b) along dim — same rank as Concat.
+    Gate range is always ~[0, 2] via 2*sigmoid(...), init near 1 (identity).
+    """
+
+    def __init__(self, dimension=1):
+        super().__init__()
+        self.d = dimension
+        self._inited = False
+        self.logit_w = nn.Parameter(torch.tensor(0.0))  # stream mix weight
+
+    def _lazy_init(self, fa, fb):
+        ca, cb = fa.shape[1], fb.shape[1]
+        self.ev_a = nn.Conv2d(ca, 1, kernel_size=1, bias=True)
+        self.ev_b = nn.Conv2d(cb, 1, kernel_size=1, bias=True)
+        self.cha = nn.Conv2d(1, ca, kernel_size=1, bias=True)
+        self.chb = nn.Conv2d(1, cb, kernel_size=1, bias=True)
+        # bias 0 => 2*sigmoid(0)=1 => identity gate at start
+        nn.init.zeros_(self.ev_a.weight)
+        nn.init.zeros_(self.ev_b.weight)
+        nn.init.zeros_(self.ev_a.bias)
+        nn.init.zeros_(self.ev_b.bias)
+        nn.init.zeros_(self.cha.weight)
+        nn.init.zeros_(self.chb.weight)
+        nn.init.zeros_(self.cha.bias)
+        nn.init.zeros_(self.chb.bias)
+        self._init_extra(ca, cb)
+        self.to(fa.device)
+        self._inited = True
+
+    def _init_extra(self, ca, cb):
+        pass
+
+    def fused_evidence(self, fa, fb):
         raise NotImplementedError
 
     def forward(self, x):
-        fa, fb = x
-        ea, eb = self.proj_a(fa), self.proj_b(fb)
-        ga, gb = self.gate_from_evidence(ea, eb)
-        fused = torch.cat((fa * ga, fb * gb), 1)
-        base = torch.cat((fa, fb), 1)
-        return base + self.gamma * self.out(fused)
+        if not isinstance(x, (list, tuple)) or len(x) < 2:
+            raise ValueError(f"{self.__class__.__name__} expects 2 feature maps")
+        fa, fb = x[0], x[1]
+        if not self._inited:
+            self._lazy_init(fa, fb)
+        S = self.fused_evidence(fa, fb)  # [B,1,H,W] in (~0,1) or logits->mapped inside
+        ga = 2.0 * torch.sigmoid(self.cha(S))
+        gb = 2.0 * torch.sigmoid(self.chb(S))
+        return torch.cat((fa * ga, fb * gb), self.d)
 
-class GqROFConcat(_BaseDualGate):
-    """Exp-1: Gaussian q-rung gate, learnable q."""
-    def __init__(self, c1, c2=None):
-        super().__init__(c1, c2)
-        self.c_mu = nn.Parameter(torch.zeros(1, self.c, 1, 1))
-        self.c_nu = nn.Parameter(torch.zeros(1, self.c, 1, 1))
-        self.s_mu = nn.Parameter(torch.ones(1, self.c, 1, 1))
-        self.s_nu = nn.Parameter(torch.ones(1, self.c, 1, 1))
+
+class GqROFConcat(_CrossStreamGate):
+    """Exp-1: cross-stream Gaussian q-rung aggregation, then matched 2*sigmoid gate."""
+
+    def _init_extra(self, ca, cb):
+        self.c_mu = nn.Parameter(torch.zeros(1, 1, 1, 1))
+        self.c_nu = nn.Parameter(torch.zeros(1, 1, 1, 1))
+        self.s_mu = nn.Parameter(torch.ones(1, 1, 1, 1))
+        self.s_nu = nn.Parameter(torch.ones(1, 1, 1, 1))
         self.rho = nn.Parameter(torch.tensor(-1.3863))  # q≈2
 
-    def _score(self, x):
+    def _orthopair(self, e):
         q = 1.0 + 5.0 * torch.sigmoid(self.rho)
-        mu = torch.exp(-((x - self.c_mu) ** 2) / (2 * _soft_sigma(self.s_mu) ** 2)).clamp(1e-6, 1)
-        nu = (1.0 - mu.pow(q)).clamp(min=0).pow(1.0 / q) * torch.exp(
-            -((x - self.c_nu) ** 2) / (2 * _soft_sigma(self.s_nu) ** 2)
+        mu = torch.exp(-((e - self.c_mu) ** 2) / (2.0 * _soft_sigma(self.s_mu) ** 2)).clamp(1e-6, 1.0)
+        nu = (1.0 - mu.pow(q)).clamp(min=0.0).pow(1.0 / q) * torch.exp(
+            -((e - self.c_nu) ** 2) / (2.0 * _soft_sigma(self.s_nu) ** 2)
         )
-        nu = nu.clamp(0, 1)
-        return 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
+        nu = nu.clamp(0.0, 1.0)
+        s = 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
+        return mu, nu, s
 
-    def gate_from_evidence(self, ea, eb):
-        return 0.5 + self._score(ea), 0.5 + self._score(eb)
+    def fused_evidence(self, fa, fb):
+        ea = self.ev_a(fa)
+        eb = self.ev_b(fb)
+        mu_a, nu_a, _ = self._orthopair(ea)
+        mu_b, nu_b, _ = self._orthopair(eb)
+        w = torch.sigmoid(self.logit_w)
+        # Algebraic weighted mix of orthopair degrees, then score (cross-stream fusion)
+        mu = w * mu_a + (1.0 - w) * mu_b
+        nu = w * nu_a + (1.0 - w) * nu_b
+        q = 1.0 + 5.0 * torch.sigmoid(self.rho)
+        # Renormalize lightly to keep numerical stability inside orthopair ball
+        norm = (mu.pow(q) + nu.pow(q)).clamp(min=1e-6)
+        scale = torch.clamp(norm, max=1.0) / norm
+        mu = (mu * scale.pow(1.0 / q)).clamp(1e-6, 1.0)
+        nu = (nu * scale.pow(1.0 / q)).clamp(0.0, 1.0)
+        S = 0.5 * (mu.pow(q) - nu.pow(q) + 1.0)
+        return S
 
-class PlainGateConcat(_BaseDualGate):
-    """Exp-2: plain feature gate, NO q."""
-    def __init__(self, c1, c2=None):
-        super().__init__(c1, c2)
-        self.gate_a = nn.Sequential(nn.Conv2d(self.c, self.c, 1), nn.Sigmoid())
-        self.gate_b = nn.Sequential(nn.Conv2d(self.c, self.c, 1), nn.Sigmoid())
 
-    def gate_from_evidence(self, ea, eb):
-        return self.gate_a(ea), self.gate_b(eb)
+class PlainGateConcat(_CrossStreamGate):
+    """Exp-2 Control A: same cross-stream mix + 2*sigmoid gates, no q-rung."""
 
-# ===================== REGISTER =====================
-import ultralytics.nn.tasks as tasks
-from ultralytics.utils.torch_utils import make_divisible
+    def fused_evidence(self, fa, fb):
+        ea = self.ev_a(fa)
+        eb = self.ev_b(fb)
+        w = torch.sigmoid(self.logit_w)
+        # Map mixed evidence to (0,1) so cha/chb see same scale family as S
+        return torch.sigmoid(w * ea + (1.0 - w) * eb)
 
-tasks.GqROFConcat = GqROFConcat
-tasks.PlainGateConcat = PlainGateConcat
 
-if not getattr(tasks, "_gqrof_parse_wrapped", False):
-    orig = tasks.parse_model
-
-    def wrapped(d, ch, verbose=True):
-        dd = copy.deepcopy(d)
-        scale = dd.get("scale")
-        depth, width, max_channels = 0.50, 0.25, 1024
-        if dd.get("scales") and scale in dd["scales"]:
-            depth, width, max_channels = dd["scales"][scale]
-        ch0 = ch if isinstance(ch, list) else [ch]
-        ch_track = [ch0[-1]]
-        bb, hd = dd["backbone"], dd["head"]
-        all_layers = bb + hd
-        for i, (f, n, m, args) in enumerate(all_layers):
-            m_name = m if isinstance(m, str) else getattr(m, "__name__", str(m))
-            if m_name in {"GqROFConcat", "PlainGateConcat"}:
-                c_in = ch_track[f[0]] if isinstance(f, list) else ch_track[f]
-                all_layers[i] = [f, n, m_name, [c_in]]
-                c2 = c_in * 2
-            elif m_name == "Concat":
-                c2 = sum(ch_track[x] for x in f)
-            elif m_name in {"Detect"}:
-                c2 = ch_track[-1]
-            elif m_name.endswith("Upsample") or m_name == "nn.Upsample":
-                c2 = ch_track[-1]
-            elif args and isinstance(args[0], int):
-                c2 = make_divisible(min(args[0], max_channels) * width, 8)
-            else:
-                c2 = ch_track[-1]
-            ch_track.append(c2)
-        dd["backbone"] = all_layers[: len(bb)]
-        dd["head"] = all_layers[len(bb) :]
-        g = orig.__globals__
-        g["GqROFConcat"] = GqROFConcat
-        g["PlainGateConcat"] = PlainGateConcat
-        if "base_modules" in g:
-            g["base_modules"] = frozenset(set(g["base_modules"]) | {GqROFConcat, PlainGateConcat})
-        return orig(dd, ch, verbose)
-
-    tasks.parse_model = wrapped
-    tasks._gqrof_parse_wrapped = True
-
-print("Registered GqROFConcat + PlainGateConcat")
-
-# ===================== YAMLs =====================
-
-def yolo26_yaml(merge_module: str) -> str:
-    return f"""
-nc: 9
+# ===================== BUILD OFFICIAL YOLO26n + REPLACE CONCAT =====================
+YOLO26_YAML = f"""
+# Official YOLO26 topology; nc=9 for oral dataset. Concat kept on purpose.
+nc: {len(names)}
 end2end: True
 reg_max: 1
 scale: n
@@ -281,61 +348,98 @@ backbone:
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, {merge_module}, []]
+  - [[-1, 6], 1, Concat, [1]]
   - [-1, 2, C3k2, [512, True]]
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, {merge_module}, []]
+  - [[-1, 4], 1, Concat, [1]]
   - [-1, 2, C3k2, [256, True]]
 
   - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 13], 1, {merge_module}, []]
+  - [[-1, 13], 1, Concat, [1]]
   - [-1, 2, C3k2, [512, True]]
 
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 10], 1, {merge_module}, []]
+  - [[-1, 10], 1, Concat, [1]]
   - [-1, 1, C3k2, [1024, True, 0.5, True]]
 
   - [[16, 19, 22], 1, Detect, [nc]]
 """.lstrip()
 
-exp1_yaml = CFG_DIR / "yolo26n_exp1_qrof.yaml"
-exp2_yaml = CFG_DIR / "yolo26n_exp2_plain_gate.yaml"
-exp1_yaml.write_text(yolo26_yaml("GqROFConcat"))
-exp2_yaml.write_text(yolo26_yaml("PlainGateConcat"))
+yaml_path = CFG_DIR / "yolo26n_oral.yaml"
+yaml_path.write_text(YOLO26_YAML)
 
-# ===================== TRAIN ONE EXPERIMENT =====================
 from ultralytics import YOLO
+from ultralytics.nn.modules import Concat
 
-if RUN == 0:
-    print("Prepare only. Set RUN=1 or RUN=2 and re-run cell.")
-elif RUN in (1, 2):
-    yaml_path = str(exp1_yaml if RUN == 1 else exp2_yaml)
-    run_name = "exp1_qrof_gate" if RUN == 1 else "exp2_plain_gate"
-    print(f"Starting {run_name} with {yaml_path}")
-    model = YOLO(yaml_path)
-    try:
-        model.load("yolo26n.pt")
-    except Exception as e:
-        print("load warning:", e)
-    model.train(
-        data=str(data_yaml),
-        imgsz=IMGSZ,
-        epochs=EPOCHS,
-        batch=BATCH,
-        seed=SEED,
-        workers=2,
-        project=str(RUNS),
-        name=run_name,
-        optimizer="auto",
-        patience=0,
-        save=True,
-        plots=True,
-    )
-    print("DONE:", RUNS / run_name)
+def copy_ultralytics_meta(dst, src):
+    for key in ("f", "i", "type", "np"):
+        if hasattr(src, key):
+            setattr(dst, key, getattr(src, key))
+    return dst
+
+def replace_concats(model, mode: int) -> int:
+    """Replace Ultralytics Concat with gated fusion. mode=1 q-rung, mode=2 plain."""
+    seq = model.model.model  # nn.Sequential of DetectionModel
+    n = 0
+    for i, layer in enumerate(seq):
+        if isinstance(layer, Concat):
+            dim = getattr(layer, "d", 1)
+            new = GqROFConcat(dimension=dim) if mode == 1 else PlainGateConcat(dimension=dim)
+            seq[i] = copy_ultralytics_meta(new, layer)
+            n += 1
+    return n
+
+def smoke_forward(model):
+    model.model.eval()
+    x = torch.zeros(1, 3, 640, 640)
+    with torch.no_grad():
+        _ = model.model(x)
+    print("smoke_forward OK")
+
+run_names = {
+    0: "exp0_yolo26n_baseline",
+    1: "exp1_qrof_gate",
+    2: "exp2_plain_gate",
+}
+assert RUN in run_names, "RUN must be 0, 1, or 2"
+
+print(f"Building YOLO26n from YAML (from scratch), RUN={RUN} ({run_names[RUN]})")
+model = YOLO(str(yaml_path))  # architecture only — NO pretrained load
+
+if RUN in (1, 2):
+    n_rep = replace_concats(model, RUN)
+    print(f"Replaced {n_rep} Concat modules")
 else:
-    raise ValueError("RUN must be 0, 1, or 2")
+    print("Baseline: keeping official Concat")
 
-# How to run one by one:
-# 1) Set RUN = 1  -> run cell  (Exp-1 q-rung, learnable q)
-# 2) Set RUN = 2  -> run cell again (Exp-2 plain gate, no q)
+smoke_forward(model)
+
+model.train(
+    data=str(data_yaml),
+    imgsz=IMGSZ,
+    epochs=EPOCHS,
+    batch=BATCH,
+    seed=SEED,
+    workers=2,
+    project=str(RUNS),
+    name=run_names[RUN],
+    optimizer="auto",
+    patience=0,
+    pretrained=False,
+    save=True,
+    plots=True,
+)
+print("TRAIN DONE:", RUNS / run_names[RUN])
+
+# Final score on held-out test (not used for early stopping — patience=0 anyway)
+best = RUNS / run_names[RUN] / "weights" / "best.pt"
+if best.exists():
+    m = YOLO(str(best))
+    print("TEST metrics:")
+    m.val(data=str(data_yaml), split="test", imgsz=IMGSZ, plots=False)
+
+# One-by-one:
+# 1) RUN=0 baseline
+# 2) RUN=1 proposed q-rung
+# 3) RUN=2 plain-gate control
